@@ -3,9 +3,21 @@
 import boto3
 import argparse
 import time
+import json
 
 def create_ssm_client(region_name):
     return boto3.client('ssm', region_name=region_name)
+
+def create_ec2_client():
+    return boto3.client('ec2')
+
+def is_instance_running(ec2_client, instance_id):
+    try:
+        response = ec2_client.describe_instances(InstanceIds=[instance_id])
+        state = response['Reservations'][0]['Instances'][0]['State']['Name']
+        return state == 'running'
+    except ec2_client.exceptions.ClientError as e:
+        return False, str(e)
 
 def send_update_ssm_agent_command(ssm_client, instance_ids):
     document_name = 'AWS-UpdateSSMAgent'
@@ -27,12 +39,9 @@ def send_update_ssm_agent_command(ssm_client, instance_ids):
             MaxErrors='0'
         )
         command_id = response['Command']['CommandId']
-        print("Update SSM Agent command sent successfully.")
-        print("Command ID:", command_id)
-        return command_id
+        return True, command_id, None
     except ssm_client.exceptions.ClientError as e:
-        print(f"Failed to send Update SSM Agent command: {e}")
-        return None
+        return False, None, str(e)
 
 def send_configure_aws_package_command(ssm_client, instance_ids):
     document_name = 'AWS-ConfigureAWSPackage'
@@ -61,12 +70,9 @@ def send_configure_aws_package_command(ssm_client, instance_ids):
             MaxErrors='0'
         )
         command_id = response['Command']['CommandId']
-        print("Configure AWS Package command sent successfully.")
-        print("Command ID:", command_id)
-        return command_id
+        return True, command_id, None
     except ssm_client.exceptions.ClientError as e:
-        print(f"Failed to send Configure AWS Package command: {e}")
-        return None
+        return False, None, str(e)
 
 def send_custom_ssm_command(ssm_client, instance_ids, document_name):
     parameters = {
@@ -92,12 +98,9 @@ def send_custom_ssm_command(ssm_client, instance_ids, document_name):
             MaxErrors='0'
         )
         command_id = response['Command']['CommandId']
-        print("Custom command sent successfully.")
-        print("Command ID:", command_id)
-        return command_id
+        return True, command_id, None
     except ssm_client.exceptions.ClientError as e:
-        print(f"Failed to send custom command: {e}")
-        return None
+        return False, None, str(e)
 
 def check_command_status(ssm_client, command_id, instance_ids):
     while True:
@@ -108,30 +111,42 @@ def check_command_status(ssm_client, command_id, instance_ids):
                 InstanceId=instance_ids[0]
             )
             status = response['Commands'][0]['Status']
-            print(f"Command {command_id} status: {status}")
             if status in ['Success', 'Failed', 'Cancelled']:
                 return status
         except ssm_client.exceptions.ClientError as e:
-            print(f"Failed to check command status: {e}")
-            return None
+            return f"Error checking status: {str(e)}"
 
-def create_ec2_client():
-    return boto3.client('ec2')
-
-def attach_iam_role_to_instance(ec2_client, instance_ids):
-    role_name = 'CloudWatchAgentServerRole'  # Hardcoded IAM role name
+def check_iam_role_attached(ec2_client, instance_id, role_name):
     try:
-        for instance_id in instance_ids:
-            response = ec2_client.associate_iam_instance_profile(
-                IamInstanceProfile={
-                    'Name': role_name
-                },
-                InstanceId=instance_id
-            )
-            print(f"Successfully attached role {role_name} to instance {instance_id}.")
-            print("Response:", response)
+        response = ec2_client.describe_iam_instance_profile_associations(
+            Filters=[
+                {
+                    'Name': 'instance-id',
+                    'Values': [instance_id]
+                }
+            ]
+        )
+        if response['IamInstanceProfileAssociations']:
+            for profile in response['IamInstanceProfileAssociations']:
+                if profile['IamInstanceProfile']['Arn'].split('/')[-1] == role_name:
+                    return True, None  # Role already attached
+            return False, "Different role attached."
+        else:
+            return False, "No IAM role attached."
     except ec2_client.exceptions.ClientError as e:
-        print(f"Failed to attach role to instance: {e}")
+        return False, str(e)
+
+def attach_iam_role_to_instance(ec2_client, instance_id, role_name):
+    try:
+        response = ec2_client.associate_iam_instance_profile(
+            IamInstanceProfile={
+                'Name': role_name
+            },
+            InstanceId=instance_id
+        )
+        return True, None
+    except ec2_client.exceptions.ClientError as e:
+        return False, str(e)
 
 def main():
     parser = argparse.ArgumentParser(description='Send SSM commands and attach IAM roles to EC2 instances.')
@@ -144,31 +159,76 @@ def main():
     ssm_client = create_ssm_client(args.region)
     ec2_client = create_ec2_client()
 
-    # Send the hardcoded commands
-    update_ssm_command_id = send_update_ssm_agent_command(ssm_client, args.instance_ids)
-    if update_ssm_command_id:
-        status = check_command_status(ssm_client, update_ssm_command_id, args.instance_ids)
-        if status != 'Success':
-            print("Update SSM Agent command failed or was not successful. Exiting.")
-            return
+    results = []
+    role_name = 'CloudWatchAgentServerRole'  # Hardcoded IAM role name
+    overall_result = True  # Track overall success or failure
 
-    configure_package_command_id = send_configure_aws_package_command(ssm_client, args.instance_ids)
-    if configure_package_command_id:
-        status = check_command_status(ssm_client, configure_package_command_id, args.instance_ids)
-        if status != 'Success':
-            print("Configure AWS Package command failed or was not successful. Exiting.")
-            return
+    for instance_id in args.instance_ids:
+        instance_result = {"instance_id": instance_id, "warning": None}
+        
+        # Check if the instance is running
+        if not is_instance_running(ec2_client, instance_id):
+            instance_result["warning"] = "Instance is not in a running state."
+            overall_result = False  # Mark overall result as failed
+            results.append(instance_result)
+            continue
 
-    # Send the custom command with the document name provided via command line
-    custom_ssm_command_id = send_custom_ssm_command(ssm_client, args.instance_ids, args.aws_package)
-    if custom_ssm_command_id:
-        status = check_command_status(ssm_client, custom_ssm_command_id, args.instance_ids)
-        if status != 'Success':
-            print("Custom command failed or was not successful. Exiting.")
-            return
+        # Check if the IAM role is already attached
+        role_attached, message = check_iam_role_attached(ec2_client, instance_id, role_name)
+        if role_attached:
+            instance_result["warning"] = "IAM role is already attached."
+        else:
+            # Attach IAM role to EC2 instance
+            success, warning = attach_iam_role_to_instance(ec2_client, instance_id, role_name)
+            if not success:
+                instance_result["warning"] = f"Failed to attach IAM role: {warning}"
+                overall_result = False  # Mark overall result as failed
 
-    # Attach IAM role to EC2 instances
-    attach_iam_role_to_instance(ec2_client, args.instance_ids)
+        # Proceed with SSM commands only if role was already attached or successfully attached
+        if not instance_result.get("warning"):
+            # Send the hardcoded Update SSM Agent command
+            success, command_id, warning = send_update_ssm_agent_command(ssm_client, [instance_id])
+            if not success:
+                instance_result["warning"] = f"Update SSM Agent command failed: {warning}"
+                overall_result = False  # Mark overall result as failed
+            else:
+                status = check_command_status(ssm_client, command_id, [instance_id])
+                if status != 'Success':
+                    instance_result["warning"] = f"Update SSM Agent command was not successful. Status: {status}"
+                    overall_result = False  # Mark overall result as failed
+
+            # Send the Configure AWS Package command if the first command was successful
+            if not instance_result.get("warning"):
+                success, command_id, warning = send_configure_aws_package_command(ssm_client, [instance_id])
+                if not success:
+                    instance_result["warning"] = f"Configure AWS Package command failed: {warning}"
+                    overall_result = False  # Mark overall result as failed
+                else:
+                    status = check_command_status(ssm_client, command_id, [instance_id])
+                    if status != 'Success':
+                        instance_result["warning"] = f"Configure AWS Package command was not successful. Status: {status}"
+                        overall_result = False  # Mark overall result as failed
+
+            # Send the custom SSM command with the document name provided via command line if the previous command was successful
+            if not instance_result.get("warning"):
+                success, command_id, warning = send_custom_ssm_command(ssm_client, [instance_id], args.aws_package)
+                if not success:
+                    instance_result["warning"] = f"Custom SSM command failed: {warning}"
+                    overall_result = False  # Mark overall result as failed
+                else:
+                    status = check_command_status(ssm_client, command_id, [instance_id])
+                    if status != 'Success':
+                        instance_result["warning"] = f"Custom SSM command was not successful. Status: {status}"
+                        overall_result = False  # Mark overall result as failed
+
+        results.append(instance_result)
+
+    # Output the results as a JSON object
+    output = {
+        "result": str(overall_result).lower(),
+        "taskoutput": results
+    }
+    print(json.dumps(output, indent=4))
 
 if __name__ == "__main__":
     main()
