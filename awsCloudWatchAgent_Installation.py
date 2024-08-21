@@ -1,4 +1,4 @@
-##python awsCloudWatchAgent_Installation.py --region us-east-2 --instance-ids i-075d77d4c3e7acec5 i-035613d48cf949cc7 --aws-package AmazonCloudWatch-ManageAgent
+##python awsCloudWatchAgent_Installation.py --region us-east-2 --instance-ids i-075dxxyyc3e7acec5 i-035613d48cxxyycc7 --aws-package AmazonCloudWatch-ManageAgent
 
 import boto3
 import argparse
