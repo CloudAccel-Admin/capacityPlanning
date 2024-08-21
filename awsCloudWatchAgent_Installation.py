@@ -159,15 +159,14 @@ def main():
 
     results = []
     role_name = 'CloudWatchAgentServerRole'  # Hardcoded IAM role name
-    overall_result = True  # Track overall success or failure
 
     for instance_id in args.instance_ids:
-        instance_result = {"instance_id": instance_id, "warning": None}
+        instance_result = {"instance_id": instance_id, "result": True, "warning": None}
         
         # Check if the instance is running
         if not is_instance_running(ec2_client, instance_id):
+            instance_result["result"] = False
             instance_result["warning"] = "Instance is not in a running state."
-            overall_result = False  # Mark overall result as failed
             results.append(instance_result)
             continue
 
@@ -179,54 +178,50 @@ def main():
             # Attach IAM role to EC2 instance
             success, warning = attach_iam_role_to_instance(ec2_client, instance_id, role_name)
             if not success:
+                instance_result["result"] = False
                 instance_result["warning"] = f"Failed to attach IAM role: {warning}"
-                overall_result = False  # Mark overall result as failed
 
         # Proceed with SSM commands only if role was already attached or successfully attached
-        if not instance_result.get("warning"):
+        if instance_result["result"]:
             # Send the hardcoded Update SSM Agent command
             success, command_id, warning = send_update_ssm_agent_command(ssm_client, [instance_id])
             if not success:
+                instance_result["result"] = False
                 instance_result["warning"] = f"Update SSM Agent command failed: {warning}"
-                overall_result = False  # Mark overall result as failed
             else:
                 status = check_command_status(ssm_client, command_id, [instance_id])
                 if status != 'Success':
+                    instance_result["result"] = False
                     instance_result["warning"] = f"Update SSM Agent command was not successful. Status: {status}"
-                    overall_result = False  # Mark overall result as failed
 
             # Send the Configure AWS Package command if the first command was successful
-            if not instance_result.get("warning"):
+            if instance_result["result"]:
                 success, command_id, warning = send_configure_aws_package_command(ssm_client, [instance_id])
                 if not success:
+                    instance_result["result"] = False
                     instance_result["warning"] = f"Configure AWS Package command failed: {warning}"
-                    overall_result = False  # Mark overall result as failed
                 else:
                     status = check_command_status(ssm_client, command_id, [instance_id])
                     if status != 'Success':
+                        instance_result["result"] = False
                         instance_result["warning"] = f"Configure AWS Package command was not successful. Status: {status}"
-                        overall_result = False  # Mark overall result as failed
 
             # Send the custom SSM command with the document name provided via command line if the previous command was successful
-            if not instance_result.get("warning"):
+            if instance_result["result"]:
                 success, command_id, warning = send_custom_ssm_command(ssm_client, [instance_id], args.aws_package)
                 if not success:
+                    instance_result["result"] = False
                     instance_result["warning"] = f"Custom SSM command failed: {warning}"
-                    overall_result = False  # Mark overall result as failed
                 else:
                     status = check_command_status(ssm_client, command_id, [instance_id])
                     if status != 'Success':
+                        instance_result["result"] = False
                         instance_result["warning"] = f"Custom SSM command was not successful. Status: {status}"
-                        overall_result = False  # Mark overall result as failed
 
         results.append(instance_result)
 
     # Output the results as a JSON object
-    output = {
-        "result": str(overall_result).lower(),
-        "taskoutput": results
-    }
-    print(json.dumps(output, indent=4))
+    print(json.dumps(results, indent=4))
 
 if __name__ == "__main__":
     main()
